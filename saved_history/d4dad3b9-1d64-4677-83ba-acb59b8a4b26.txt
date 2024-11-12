@@ -1,3 +1,4 @@
+====================================================================================================
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -224,8 +225,9 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
-    n_embd : int = 768
+    n_head : int = 8 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 1024
+    vocab_embed: int = 512
 
 class GPT(nn.Module):
 
@@ -234,17 +236,20 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.vocab_embed),
+            proj_in = CastedLinear(config.vocab_embed, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            proj_out = CastedLinear(config.n_embd, config.vocab_embed, bias=False)
         ))
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = CastedLinear(config.vocab_embed, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
         self.skip_weights = nn.Parameter(torch.ones(config.n_layer // 2))
 
     def forward(self, idx, target):
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, vocab_embed)
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x = F.relu(self.transformer.proj_in(x))
         x0 = x
         v1 = None
         skip_connections = []
@@ -257,6 +262,7 @@ class GPT(nn.Module):
                 weighted_skip = skip_connections.pop() * self.skip_weights[i - self.config.n_layer//2]
                 x, v1 = block(x + weighted_skip, v1, x0)
 
+        x = F.relu(self.transformer.proj_out(x))
         x = F.rms_norm(x, (x.size(-1),))
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
@@ -419,7 +425,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=8, n_head=8, n_embd=1024, vocab_embed=256))
 model = model.cuda().bfloat16()
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print0(f"number of parameters: {trainable_params}")
@@ -442,25 +448,14 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.2,   betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+scalar_params = [p for p in params if p.ndim < 2]
 optimizer3 = Muon(matrix_params, lr=0.08, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.08, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
-
-optimized_params = set()
-for opt in optimizers:
-    for group in opt.param_groups:
-        for p in group['params']:
-            optimized_params.add(p)
-
-for name, param in model.named_parameters():
-    if param not in optimized_params:
-        print0(f"WARNING: Parameter `{name}` is not included in any optimizer.")
-
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -547,10 +542,10 @@ for step in range(args.num_iterations + 1):
         else:
             loss.backward() # just sync on the last step
     for name, p in model.named_parameters():
-        if p.grad is not None:
+        try:
             p.grad /= train_accumulation_steps
-        else:
-            raise ValueError(f"Parameter `{name}` has no gradient and was skipped during normalization.")
+        except TypeError as e:
+            print(f"TypeError: {name} - {e}")
     # momentum warmup for Muon
     frac = min(step/500, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
@@ -573,3 +568,61 @@ if master_process:
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
+====================================================================================================
+Running pytorch 2.5.1+cu124 compiled for CUDA 12.4
+nvidia-smi:
+Tue Nov 12 21:57:38 2024       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.90.12              Driver Version: 550.90.12      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:61:00.0 Off |                    0 |
+| N/A   41C    P0             82W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:62:00.0 Off |                    0 |
+| N/A   35C    P0            120W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:63:00.0 Off |                    0 |
+| N/A   35C    P0            113W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:64:00.0 Off |                    0 |
+| N/A   34C    P0            118W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:6A:00.0 Off |                    0 |
+| N/A   34C    P0            119W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:6B:00.0 Off |                    0 |
+| N/A   34C    P0            119W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:6C:00.0 Off |                    0 |
+| N/A   34C    P0            114W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:6D:00.0 Off |                    0 |
+| N/A   32C    P0            118W /  700W |     530MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Training DataLoader: total number of tokens: 2000000000 across 20 files
+Validation DataLoader: total number of tokens: 100000000 across 1 files
+====================================================================================================
+number of parameters: 126944284
+step:0/3242 val_loss:10.8258 train_time:228ms step_avg:nanms
+step:1/3242 train_loss:10.8258 train_time:89556ms step_avg:nanms

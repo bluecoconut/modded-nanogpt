@@ -1,3 +1,4 @@
+====================================================================================================
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -239,25 +240,21 @@ class GPT(nn.Module):
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
-        self.skip_weights = nn.Parameter(torch.ones(config.n_layer // 2))
+        self.layer_turn_on_after_step = [
+            0, 0, 0 *([500]*(config.n_layer-6)), 0, 0, 0
+        ]
 
-    def forward(self, idx, target):
+    def forward(self, idx, target, step=None):
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
-        skip_connections = []
-
         for i, block in enumerate(self.transformer.h):
-            if i < self.config.n_layer//2:
+            if step is None or step >= self.layer_turn_on_after_step[i]:
                 x, v1 = block(x, v1, x0)
-                skip_connections.append(x)
-            else:
-                weighted_skip = skip_connections.pop() * self.skip_weights[i - self.config.n_layer//2]
-                x, v1 = block(x + weighted_skip, v1, x0)
-
         x = F.rms_norm(x, (x.size(-1),))
+
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
@@ -421,9 +418,6 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print0(f"number of parameters: {trainable_params}")
-
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
@@ -431,7 +425,7 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
+model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
@@ -442,27 +436,33 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.2,   betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
-params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.08, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.08, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+
+# Collect per-layer parameters
+layer_matrix_params = []
+layer_scalar_params = []
+for i, layer in enumerate(raw_model.transformer.h):
+    matrix_params = [p for p in layer.parameters() if p.ndim == 2]
+    scalar_params = [p for p in layer.parameters() if p.ndim < 2]
+    layer_matrix_params.append((i, matrix_params))
+    layer_scalar_params.append((i, scalar_params))
+
+# Create per-layer parameter groups with initial learning rates
+param_groups_muon = []
+for i, matrix_params in layer_matrix_params:
+    param_groups_muon.append({'params': matrix_params, 'layer': i, 'lr': 0.04})
+
+param_groups_adam = []
+for i, scalar_params in layer_scalar_params:
+    param_groups_adam.append({'params': scalar_params, 'layer': i, 'lr': 0.04})
+
+# Initialize the optimizers with the parameter groups
+optimizer3 = Muon(param_groups_muon, momentum=0.95)
+optimizer4 = torch.optim.Adam(param_groups_adam, betas=(0.9, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
-
-optimized_params = set()
-for opt in optimizers:
-    for group in opt.param_groups:
-        for p in group['params']:
-            optimized_params.add(p)
-
-for name, param in model.named_parameters():
-    if param not in optimized_params:
-        print0(f"WARNING: Parameter `{name}` is not included in any optimizer.")
-
 # learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
+def base_lr_multiplier(it):
     assert it <= args.num_iterations
     # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
@@ -474,7 +474,30 @@ def get_lr(it):
     else:
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+def transformer_weight_lr(layer, step):
+    # o = 0.1
+    # return ((1+o) + (1-o)*np.cos(np.pi * (layer / 11 )))/2.0
+    if 3 <= layer <= 8:
+        if 500 < step < 1000:
+            return 2.0
+        else:
+            return 1.0
+    else:
+        if 500 < step < 700:
+            return 2.0
+    return 1.0
+
+def make_lr_lambda(layer):
+    return lambda step: base_lr_multiplier(step) * transformer_weight_lr(layer, step)
+
+scheduler1 = torch.optim.lr_scheduler.LambdaLR(optimizer1, lr_lambda=base_lr_multiplier)
+scheduler2 = torch.optim.lr_scheduler.LambdaLR(optimizer2, lr_lambda=base_lr_multiplier)
+lambdas_muon = [make_lr_lambda(param_group['layer']) for param_group in optimizer3.param_groups]
+scheduler3 = torch.optim.lr_scheduler.LambdaLR(optimizer3, lr_lambda=lambdas_muon)
+lambdas_adam = [make_lr_lambda(param_group['layer']) for param_group in optimizer4.param_groups]
+scheduler4 = torch.optim.lr_scheduler.LambdaLR(optimizer4, lr_lambda=lambdas_adam)
+schedulers = [scheduler1, scheduler2, scheduler3, scheduler4]
 
 # Start training loop
 training_time_ms = 0
@@ -536,7 +559,7 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
         # forward pass
-        loss = model(x, y)
+        loss = model(x, y, step=step)
         train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -546,14 +569,13 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            p.grad /= train_accumulation_steps
-        else:
-            raise ValueError(f"Parameter `{name}` has no gradient and was skipped during normalization.")
+    for p in model.parameters():
+        p.grad = torch.zeros_like(p) if p.grad is None else p.grad / train_accumulation_steps
     # momentum warmup for Muon
-    frac = min(step/500, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    for param_group in optimizer3.param_groups:
+        frac = min(step / 1000, 1)
+        new_momentum = (1 - frac) * 0.85 + frac * 0.97
+        param_group['momentum'] = new_momentum
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -573,3 +595,59 @@ if master_process:
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
+====================================================================================================
+Running pytorch 2.5.1+cu124 compiled for CUDA 12.4
+nvidia-smi:
+Tue Nov 12 21:01:59 2024       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.90.12              Driver Version: 550.90.12      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:61:00.0 Off |                    0 |
+| N/A   40C    P0             82W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:62:00.0 Off |                    0 |
+| N/A   33C    P0             74W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:63:00.0 Off |                    0 |
+| N/A   34C    P0             94W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:64:00.0 Off |                    0 |
+| N/A   33C    P0             80W /  700W |      22MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:6A:00.0 Off |                    0 |
+| N/A   33C    P0            118W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:6B:00.0 Off |                    0 |
+| N/A   34C    P0            113W /  700W |      23MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:6C:00.0 Off |                    0 |
+| N/A   33C    P0            114W /  700W |      42MiB /  81559MiB |      1%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:6D:00.0 Off |                    0 |
+| N/A   30C    P0             75W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Training DataLoader: total number of tokens: 2000000000 across 20 files
+Validation DataLoader: total number of tokens: 100000000 across 1 files
+====================================================================================================
+step:0/3242 val_loss:10.8258 train_time:227ms step_avg:nanms
